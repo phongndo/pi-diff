@@ -92,6 +92,90 @@ describe("buildReviewModel", () => {
     ).toEqual([2, 11]);
   });
 
+  it("includes apply_patch file additions in session turn diffs", () => {
+    const entries: SessionEntry[] = [
+      {
+        type: "message",
+        id: "u1",
+        parentId: null,
+        timestamp: "2026-04-23T00:00:00.000Z",
+        message: { role: "user", content: "add a poem", timestamp: 1 },
+      },
+      {
+        type: "message",
+        id: "a1",
+        parentId: "u1",
+        timestamp: "2026-04-23T00:00:01.000Z",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "call-patch",
+              name: "apply_patch",
+              arguments: {
+                input: [
+                  "*** Begin Patch",
+                  "*** Add File: PI_DIFF_TEST_POEM.txt",
+                  "+Soft lines in a quiet diff,",
+                  "+No wheels turn, no gears shift.",
+                  "+Just a small verse left in view,",
+                  "+To prove the change came gently through.",
+                  "*** End Patch",
+                ].join("\n"),
+              },
+            },
+          ],
+          api: "test-api",
+          provider: "test-provider",
+          model: "test-model",
+          usage,
+          stopReason: "toolUse",
+          timestamp: 2,
+        },
+      },
+      {
+        type: "message",
+        id: "t1",
+        parentId: "a1",
+        timestamp: "2026-04-23T00:00:02.000Z",
+        message: {
+          role: "toolResult",
+          toolCallId: "call-patch",
+          toolName: "apply_patch",
+          isError: false,
+          content: [{ type: "text", text: "Applied patch successfully." }],
+          details: {
+            status: "success",
+            result: { changedFiles: ["PI_DIFF_TEST_POEM.txt"] },
+          },
+          timestamp: 3,
+        },
+      },
+    ];
+
+    const model = buildReviewModel(entries);
+
+    expect(model.turns).toHaveLength(1);
+    expect(model.totalFiles).toBe(1);
+    expect(model.totalHunks).toBe(1);
+    expect(model.additions).toBe(4);
+    expect(model.removals).toBe(0);
+    expect(model.turns[0]?.files[0]?.path).toBe("PI_DIFF_TEST_POEM.txt");
+    expect(model.turns[0]?.files[0]?.hunks[0]).toMatchObject({
+      toolName: "apply_patch",
+      jumpLine: 1,
+      additions: 4,
+      removals: 0,
+      bodyLines: [
+        "+Soft lines in a quiet diff,",
+        "+No wheels turn, no gears shift.",
+        "+Just a small verse left in view,",
+        "+To prove the change came gently through.",
+      ],
+    });
+  });
+
   it("keeps the full normalized user prompt for expanded action views", () => {
     const longPrompt =
       `${"summarize these changes ".repeat(12)}final instruction`.trim();

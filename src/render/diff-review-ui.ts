@@ -100,6 +100,16 @@ type RenderRow = TurnRow | FileRow | HunkRow | DiffLineRow;
 type DetailRow = FileRow | HunkRow | DiffLineRow;
 type FoldableDetailRow = FileRow | HunkRow;
 
+interface RowSet {
+  rows: RenderRow[];
+}
+
+interface ScopedRowSetCache {
+  source: RowSet;
+  scopeTurnId: string;
+  rowSet: RowSet;
+}
+
 const MAX_SUMMARY_BODY_CHARS = 24_000;
 const BRACKET_CHORD_TIMEOUT_MS = 600;
 
@@ -126,6 +136,20 @@ interface SearchMatch {
   file?: ReviewFile;
   hunk?: ReviewHunk;
   text: string;
+  normalizedText: string;
+}
+
+interface SearchTargetCache {
+  mode: SearchMode;
+  rowSet: RowSet | undefined;
+  targets: SearchMatch[];
+}
+
+interface SearchMatchesCache {
+  mode: SearchMode;
+  queryKey: string;
+  targets: SearchMatch[];
+  matches: SearchMatch[];
 }
 
 interface BracketCommand {
@@ -179,7 +203,11 @@ export class DiffReviewComponent implements Component {
   private visibleParentById = new Map<string, string | undefined>();
   private visibleChildrenById = new Map<string | undefined, string[]>();
   private multipleVisibleRoots = false;
-  private cachedRows: RenderRow[] | undefined;
+  private cachedRowSet: RowSet | undefined;
+  private scopedRowSetCache: ScopedRowSetCache | undefined;
+  private searchTargetCache: SearchTargetCache | undefined;
+  private searchMatchesCache: SearchMatchesCache | undefined;
+  private readonly highlightedDiffLineCache = new Map<string, string>();
   private selectedId: string | undefined;
   private detailTurnId: string | undefined;
   private lastPageSize = 5;
@@ -877,7 +905,10 @@ export class DiffReviewComponent implements Component {
     this.visibleParentById = new Map<string, string | undefined>();
     this.visibleChildrenById = new Map<string | undefined, string[]>();
     this.multipleVisibleRoots = false;
-    this.cachedRows = undefined;
+    this.cachedRowSet = undefined;
+    this.scopedRowSetCache = undefined;
+    this.invalidateSearchCaches();
+    this.highlightedDiffLineCache.clear();
     this.selectedId = undefined;
     this.detailTurnId = undefined;
     this.pendingG = false;
@@ -960,7 +991,7 @@ export class DiffReviewComponent implements Component {
   private summaryRequestForRow(row: RenderRow): DiffReviewSummaryRequest {
     return {
       title: this.summaryTitleForRow(row),
-      body: truncateSummaryBody(this.summaryBodyForRow(row)),
+      body: this.summaryBodyForRow(row),
     };
   }
 
@@ -980,24 +1011,26 @@ export class DiffReviewComponent implements Component {
   }
 
   private summaryForTurn(turn: ReviewTurn): string {
-    return [
-      `Scope: turn ${turn.ordinal}`,
-      `Prompt: ${turn.prompt || "(empty prompt)"}`,
-      `Stats: +${turn.additions} -${turn.removals}`,
-      `Files: ${turn.files.length}`,
-      "",
-      ...turn.files.flatMap((file) => this.summaryLinesForFile(file)),
-    ].join("\n");
+    const builder = new SummaryBodyBuilder(MAX_SUMMARY_BODY_CHARS);
+    builder.addLine(`Scope: turn ${turn.ordinal}`);
+    builder.addLine(`Prompt: ${turn.prompt || "(empty prompt)"}`);
+    builder.addLine(`Stats: +${turn.additions} -${turn.removals}`);
+    builder.addLine(`Files: ${turn.files.length}`);
+    builder.addLine();
+    for (const file of turn.files) {
+      this.addSummaryLinesForFile(builder, file);
+    }
+    return builder.toString();
   }
 
   private summaryForFile(file: ReviewFile, turn: ReviewTurn): string {
-    return [
-      `Scope: file ${file.path}`,
-      `Turn: ${turn.prompt || "(empty prompt)"}`,
-      `Stats: +${file.additions} -${file.removals}`,
-      "",
-      ...this.summaryLinesForFile(file),
-    ].join("\n");
+    const builder = new SummaryBodyBuilder(MAX_SUMMARY_BODY_CHARS);
+    builder.addLine(`Scope: file ${file.path}`);
+    builder.addLine(`Turn: ${turn.prompt || "(empty prompt)"}`);
+    builder.addLine(`Stats: +${file.additions} -${file.removals}`);
+    builder.addLine();
+    this.addSummaryLinesForFile(builder, file);
+    return builder.toString();
   }
 
   private summaryForHunk(
@@ -1005,30 +1038,40 @@ export class DiffReviewComponent implements Component {
     file: ReviewFile,
     turn: ReviewTurn,
   ): string {
-    return [
-      `Scope: hunk ${hunk.path}:${hunk.jumpLine}`,
-      `Turn: ${turn.prompt || "(empty prompt)"}`,
-      `File: ${file.path}`,
-      `Tool: ${hunk.toolName}`,
-      `Stats: +${hunk.additions} -${hunk.removals}`,
-      "",
-      ...this.summaryLinesForHunk(hunk),
-    ].join("\n");
+    const builder = new SummaryBodyBuilder(MAX_SUMMARY_BODY_CHARS);
+    builder.addLine(`Scope: hunk ${hunk.path}:${hunk.jumpLine}`);
+    builder.addLine(`Turn: ${turn.prompt || "(empty prompt)"}`);
+    builder.addLine(`File: ${file.path}`);
+    builder.addLine(`Tool: ${hunk.toolName}`);
+    builder.addLine(`Stats: +${hunk.additions} -${hunk.removals}`);
+    builder.addLine();
+    this.addSummaryLinesForHunk(builder, hunk);
+    return builder.toString();
   }
 
-  private summaryLinesForFile(file: ReviewFile): string[] {
-    return [
+  private addSummaryLinesForFile(
+    builder: SummaryBodyBuilder,
+    file: ReviewFile,
+  ): void {
+    builder.addLine(
       `File: ${file.path} (+${file.additions} -${file.removals}, ${file.hunks.length} hunk${file.hunks.length === 1 ? "" : "s"})`,
-      ...file.hunks.flatMap((hunk) => this.summaryLinesForHunk(hunk)),
-      "",
-    ];
+    );
+    for (const hunk of file.hunks) {
+      this.addSummaryLinesForHunk(builder, hunk);
+    }
+    builder.addLine();
   }
 
-  private summaryLinesForHunk(hunk: ReviewHunk): string[] {
-    return [
+  private addSummaryLinesForHunk(
+    builder: SummaryBodyBuilder,
+    hunk: ReviewHunk,
+  ): void {
+    builder.addLine(
       `  Hunk: ${hunk.path}:${hunk.jumpLine} ${hunk.toolName} (+${hunk.additions} -${hunk.removals})`,
-      ...hunk.bodyLines.map((line) => `    ${line}`),
-    ];
+    );
+    for (const line of hunk.bodyLines) {
+      builder.addLine(`    ${line}`);
+    }
   }
 
   private addUndoAction(
@@ -1215,24 +1258,47 @@ export class DiffReviewComponent implements Component {
   }
 
   private getRows(): RenderRow[] {
-    return this.scopeRowsForSelectedDetail(this.getAllRows());
+    return this.getCurrentRowSet().rows;
   }
 
-  private getAllRows(): RenderRow[] {
-    this.cachedRows ??= this.buildRows();
-    return this.cachedRows;
+  private getAllRowSet(): RowSet {
+    if (!this.cachedRowSet) {
+      this.cachedRowSet = createRowSet(this.buildRows());
+    }
+    return this.cachedRowSet;
   }
 
-  private scopeRowsForSelectedDetail(rows: readonly RenderRow[]): RenderRow[] {
+  private getCurrentRowSet(): RowSet {
+    const source = this.getAllRowSet();
     const selectedRow = this.selectedId
-      ? rows.find((row) => row.id === this.selectedId)
+      ? source.rows.find((row) => row.id === this.selectedId)
       : undefined;
-    if (!selectedRow || selectedRow.kind === "turn") return [...rows];
-    return rows.filter((row) => row.turn.id === selectedRow.turn.id);
+    if (!selectedRow || selectedRow.kind === "turn") return source;
+
+    const scopeTurnId = selectedRow.turn.id;
+    if (
+      this.scopedRowSetCache?.source === source &&
+      this.scopedRowSetCache.scopeTurnId === scopeTurnId
+    ) {
+      return this.scopedRowSetCache.rowSet;
+    }
+
+    const rowSet = createRowSet(
+      source.rows.filter((row) => row.turn.id === scopeTurnId),
+    );
+    this.scopedRowSetCache = { source, scopeTurnId, rowSet };
+    return rowSet;
   }
 
   private invalidateRows(): void {
-    this.cachedRows = undefined;
+    this.cachedRowSet = undefined;
+    this.scopedRowSetCache = undefined;
+    this.invalidateSearchCaches();
+  }
+
+  private invalidateSearchCaches(): void {
+    this.searchTargetCache = undefined;
+    this.searchMatchesCache = undefined;
   }
 
   private buildRows(): RenderRow[] {
@@ -1529,8 +1595,16 @@ export class DiffReviewComponent implements Component {
   }
 
   private renderDiffLine(line: string, filePath: string): string {
+    const cacheKey = `${filePath}\0${line}`;
+    const cached = this.highlightedDiffLineCache.get(cacheKey);
+    if (cached !== undefined) return cached;
+
     const parsed = parseDiffLine(line);
-    if (!parsed) return this.theme.fg("toolDiffContext", line);
+    if (!parsed) {
+      const renderedLine = this.theme.fg("toolDiffContext", line);
+      this.highlightedDiffLineCache.set(cacheKey, renderedLine);
+      return renderedLine;
+    }
 
     const prefixColor =
       parsed.marker === "+"
@@ -1544,8 +1618,11 @@ export class DiffReviewComponent implements Component {
       filePath,
     );
 
-    if (!highlightedContent) return prefix;
-    return `${prefix}${highlightedContent}`;
+    const renderedLine = highlightedContent
+      ? `${prefix}${highlightedContent}`
+      : prefix;
+    this.highlightedDiffLineCache.set(cacheKey, renderedLine);
+    return renderedLine;
   }
 
   private highlightDiffContent(content: string, filePath: string): string {
@@ -1649,14 +1726,61 @@ export class DiffReviewComponent implements Component {
   private searchMatches(): SearchMatch[] {
     const tokens = searchTokens(this.searchQuery);
     if (tokens.length === 0) return [];
-    return this.searchTargets().filter((match) =>
-      this.searchTextMatches(match.text, tokens),
+    const queryKey = tokens.join("\0");
+    const targets = this.searchTargets();
+    if (
+      this.searchMatchesCache?.mode === this.searchMode &&
+      this.searchMatchesCache.queryKey === queryKey &&
+      this.searchMatchesCache.targets === targets
+    ) {
+      return this.searchMatchesCache.matches;
+    }
+
+    const matches = targets.filter((match) =>
+      this.searchTextMatches(match, tokens),
     );
+    this.searchMatchesCache = {
+      mode: this.searchMode,
+      queryKey,
+      targets,
+      matches,
+    };
+    return matches;
   }
 
   private searchTargets(): SearchMatch[] {
-    if (this.searchMode === "grep") return this.grepSearchTargets();
-    return this.getRows().map((row) => this.searchMatchForRow(row));
+    if (this.searchMode === "grep") {
+      if (
+        this.searchTargetCache?.mode === "grep" &&
+        this.searchTargetCache.rowSet === undefined
+      ) {
+        return this.searchTargetCache.targets;
+      }
+
+      const targets = this.grepSearchTargets();
+      this.searchTargetCache = {
+        mode: "grep",
+        rowSet: undefined,
+        targets,
+      };
+      return targets;
+    }
+
+    const rowSet = this.getCurrentRowSet();
+    if (
+      this.searchTargetCache?.mode === "tree" &&
+      this.searchTargetCache.rowSet === rowSet
+    ) {
+      return this.searchTargetCache.targets;
+    }
+
+    const targets = rowSet.rows.map((row) => this.searchMatchForRow(row));
+    this.searchTargetCache = {
+      mode: "tree",
+      rowSet,
+      targets,
+    };
+    return targets;
   }
 
   private grepSearchTargets(): SearchMatch[] {
@@ -1668,41 +1792,49 @@ export class DiffReviewComponent implements Component {
       if (!turn) return;
       visitedTurnIds.add(turnId);
 
-      matches.push({
-        id: turn.id,
-        kind: "turn",
-        turn,
-        text: this.turnPlainText(turn),
-      });
+      matches.push(
+        this.createSearchMatch({
+          id: turn.id,
+          kind: "turn",
+          turn,
+          text: this.turnPlainText(turn),
+        }),
+      );
 
       for (const file of turn.files) {
-        matches.push({
-          id: file.id,
-          kind: "file",
-          turn,
-          file,
-          text: this.filePlainText(file),
-        });
-
-        for (const hunk of file.hunks) {
-          matches.push({
-            id: hunk.id,
-            kind: "hunk",
+        matches.push(
+          this.createSearchMatch({
+            id: file.id,
+            kind: "file",
             turn,
             file,
-            hunk,
-            text: this.hunkPlainText(hunk),
-          });
+            text: this.filePlainText(file),
+          }),
+        );
 
-          for (let index = 0; index < hunk.bodyLines.length; index++) {
-            matches.push({
-              id: diffLineRowId(hunk, index),
-              kind: "diff",
+        for (const hunk of file.hunks) {
+          matches.push(
+            this.createSearchMatch({
+              id: hunk.id,
+              kind: "hunk",
               turn,
               file,
               hunk,
-              text: hunk.bodyLines[index] ?? "",
-            });
+              text: this.hunkPlainText(hunk),
+            }),
+          );
+
+          for (let index = 0; index < hunk.bodyLines.length; index++) {
+            matches.push(
+              this.createSearchMatch({
+                id: diffLineRowId(hunk, index),
+                kind: "diff",
+                turn,
+                file,
+                hunk,
+                text: hunk.bodyLines[index] ?? "",
+              }),
+            );
           }
         }
       }
@@ -1726,48 +1858,59 @@ export class DiffReviewComponent implements Component {
 
   private searchMatchForRow(row: RenderRow): SearchMatch {
     if (row.kind === "turn") {
-      return {
+      return this.createSearchMatch({
         id: row.id,
         kind: row.kind,
         turn: row.turn,
         text: this.turnPlainText(row.turn),
-      };
+      });
     }
 
     if (row.kind === "file") {
-      return {
+      return this.createSearchMatch({
         id: row.id,
         kind: row.kind,
         turn: row.turn,
         file: row.file,
         text: this.filePlainText(row.file),
-      };
+      });
     }
 
     if (row.kind === "hunk") {
-      return {
+      return this.createSearchMatch({
         id: row.id,
         kind: row.kind,
         turn: row.turn,
         file: row.file,
         hunk: row.hunk,
         text: this.hunkPlainText(row.hunk),
-      };
+      });
     }
 
-    return {
+    return this.createSearchMatch({
       id: row.id,
       kind: row.kind,
       turn: row.turn,
       file: row.file,
       hunk: row.hunk,
       text: row.text,
+    });
+  }
+
+  private createSearchMatch(
+    match: Omit<SearchMatch, "normalizedText">,
+  ): SearchMatch {
+    return {
+      ...match,
+      normalizedText: match.text.toLowerCase(),
     };
   }
 
-  private searchTextMatches(text: string, tokens: readonly string[]): boolean {
-    const normalizedText = text.toLowerCase();
-    return tokens.every((token) => normalizedText.includes(token));
+  private searchTextMatches(
+    match: SearchMatch,
+    tokens: readonly string[],
+  ): boolean {
+    return tokens.every((token) => match.normalizedText.includes(token));
   }
 
   private turnPlainText(turn: ReviewTurn): string {
@@ -1796,7 +1939,8 @@ export class DiffReviewComponent implements Component {
   }
 
   private moveSelection(delta: number): void {
-    const rows = this.getRows();
+    const rowSet = this.getCurrentRowSet();
+    const rows = rowSet.rows;
     if (rows.length === 0) return;
     const currentIndex = Math.max(
       0,
@@ -2032,7 +2176,9 @@ export class DiffReviewComponent implements Component {
     options: { preserveDetailTurn?: boolean } = {},
   ): void {
     if (!id) return;
-    const row = this.getAllRows().find((candidate) => candidate.id === id);
+    const row = this.getAllRowSet().rows.find(
+      (candidate) => candidate.id === id,
+    );
     this.selectedId = id;
     if (!row) return;
 
@@ -2057,7 +2203,9 @@ export class DiffReviewComponent implements Component {
 
   private getSelectedRow(): RenderRow | undefined {
     if (!this.selectedId) return undefined;
-    return this.getRows().find((row) => row.id === this.selectedId);
+    return this.getCurrentRowSet().rows.find(
+      (row) => row.id === this.selectedId,
+    );
   }
 
   private getSelectedTurn(): ReviewTurn | undefined {
@@ -2154,14 +2302,15 @@ export class DiffReviewComponent implements Component {
   }
 
   private statusText(): string {
-    const rows = this.getRows();
-    const position = Math.max(
-      0,
-      rows.findIndex((row) => row.id === this.selectedId) + 1,
+    const rowSet = this.getCurrentRowSet();
+    const selectedIndex = rowSet.rows.findIndex(
+      (row) => row.id === this.selectedId,
     );
-    const selectedRow = this.getSelectedRow();
+    const position = selectedIndex + 1;
+    const selectedRow =
+      selectedIndex === -1 ? undefined : rowSet.rows[selectedIndex];
     const scopeText = selectedRow ? this.scopeStatusText(selectedRow) : "";
-    return `  (${position}/${rows.length})${scopeText ? ` ${scopeText}` : ""}`;
+    return `  (${Math.max(0, position)}/${rowSet.rows.length})${scopeText ? ` ${scopeText}` : ""}`;
   }
 
   private scopeStatusText(row: RenderRow): string {
@@ -2306,9 +2455,44 @@ interface ParsedDiffLine {
   lineNumber?: number;
 }
 
-function truncateSummaryBody(body: string): string {
-  if (body.length <= MAX_SUMMARY_BODY_CHARS) return body;
-  return `${body.slice(0, MAX_SUMMARY_BODY_CHARS)}\n\n[BetterDiff summary context truncated at ${MAX_SUMMARY_BODY_CHARS} characters]`;
+class SummaryBodyBuilder {
+  private readonly chunks: string[] = [];
+  private length = 0;
+  private truncated = false;
+
+  constructor(private readonly maxChars: number) {}
+
+  addLine(line = ""): void {
+    this.append(`${this.chunks.length === 0 ? "" : "\n"}${line}`);
+  }
+
+  toString(): string {
+    return this.chunks.join("");
+  }
+
+  private append(text: string): void {
+    if (this.truncated) return;
+
+    const remaining = this.maxChars - this.length;
+    if (text.length <= remaining) {
+      this.chunks.push(text);
+      this.length += text.length;
+      return;
+    }
+
+    if (remaining > 0) {
+      this.chunks.push(text.slice(0, remaining));
+      this.length += remaining;
+    }
+    this.chunks.push(
+      `\n\n[BetterDiff summary context truncated at ${this.maxChars} characters]`,
+    );
+    this.truncated = true;
+  }
+}
+
+function createRowSet(rows: RenderRow[]): RowSet {
+  return { rows };
 }
 
 function diffLineRowId(hunk: ReviewHunk, index: number): string {
@@ -2381,11 +2565,11 @@ function undoEditHunks(
 
     const rawContent = readFileSync(absolutePath, "utf8");
     const lineEnding = detectLineEnding(rawContent);
-    let normalizedContent = normalizeLineEndings(rawContent);
+    const normalizedLines = normalizeLineEndings(rawContent).split("\n");
 
     for (const edit of [...edits].sort(compareEditsFromBottom)) {
-      normalizedContent = replaceLineSequenceAtExpectedLocation(
-        normalizedContent,
+      replaceLineSequenceAtExpectedLocation(
+        normalizedLines,
         edit.currentLines,
         edit.restoredLines,
         edit.hunk,
@@ -2393,6 +2577,10 @@ function undoEditHunks(
       );
     }
 
+    const normalizedContent =
+      normalizedLines.length === 1 && normalizedLines[0] === ""
+        ? ""
+        : normalizedLines.join("\n");
     nextContentByPath.set(
       absolutePath,
       restoreLineEndings(normalizedContent, lineEnding),
@@ -2462,13 +2650,12 @@ function compareEditsFromBottom(
 }
 
 function replaceLineSequenceAtExpectedLocation(
-  content: string,
+  lines: string[],
   searchLines: readonly string[],
   replacementLines: readonly string[],
   hunk: ReviewHunk,
   expectedStartLine: number,
-): string {
-  const lines = content.split("\n");
+): void {
   const matchIndex = expectedStartLine - 1;
 
   if (!lineSequenceMatches(lines, searchLines, matchIndex)) {
@@ -2477,13 +2664,7 @@ function replaceLineSequenceAtExpectedLocation(
     );
   }
 
-  const nextLines = [
-    ...lines.slice(0, matchIndex),
-    ...replacementLines,
-    ...lines.slice(matchIndex + searchLines.length),
-  ];
-  if (nextLines.length === 1 && nextLines[0] === "") return "";
-  return nextLines.join("\n");
+  lines.splice(matchIndex, searchLines.length, ...replacementLines);
 }
 
 function lineSequenceMatches(

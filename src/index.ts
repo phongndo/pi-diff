@@ -30,6 +30,8 @@ export const BETTERDIFF_NEXT_STEPS = [
   "Add golden tests for renderer output and editor adapter targeting.",
 ] as const;
 
+const UNTRACKED_DIFF_CONCURRENCY = 4;
+
 export default function betterDiffExtension(pi: ExtensionAPI): void {
   async function openDiffReview(
     ctx: ExtensionCommandContext,
@@ -152,26 +154,42 @@ export default function betterDiffExtension(pi: ExtensionAPI): void {
     ctx: ExtensionCommandContext,
     paths: readonly string[],
   ): Promise<string> {
-    const patches: string[] = [];
+    if (paths.length === 0) return "";
 
-    for (const path of paths) {
-      const result = await pi.exec("git", gitUntrackedDiffArgs(path), {
-        cwd: ctx.cwd,
-        timeout: 30_000,
-      });
-      if (
-        result.code !== 0 &&
-        !(result.code === 1 && result.stdout.length > 0)
-      ) {
-        throw new Error(
-          result.stderr.trim() ||
-            `git untracked diff for ${path} exited with status ${result.code}`,
-        );
-      }
-      if (result.stdout.length > 0) patches.push(result.stdout);
-    }
+    const patches = Array<string>(paths.length).fill("");
+    let nextIndex = 0;
+    const workerCount = Math.min(UNTRACKED_DIFF_CONCURRENCY, paths.length);
+
+    await Promise.all(
+      Array.from({ length: workerCount }, async () => {
+        for (;;) {
+          const index = nextIndex;
+          nextIndex += 1;
+          const path = paths[index];
+          if (path === undefined) return;
+          patches[index] = await loadSingleUntrackedGitPatch(ctx, path);
+        }
+      }),
+    );
 
     return joinGitPatches(patches);
+  }
+
+  async function loadSingleUntrackedGitPatch(
+    ctx: ExtensionCommandContext,
+    path: string,
+  ): Promise<string> {
+    const result = await pi.exec("git", gitUntrackedDiffArgs(path), {
+      cwd: ctx.cwd,
+      timeout: 30_000,
+    });
+    if (result.code !== 0 && !(result.code === 1 && result.stdout.length > 0)) {
+      throw new Error(
+        result.stderr.trim() ||
+          `git untracked diff for ${path} exited with status ${result.code}`,
+      );
+    }
+    return result.stdout;
   }
 
   async function loadGitBranchReviewModel(

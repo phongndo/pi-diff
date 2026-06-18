@@ -28,7 +28,7 @@ pi install git:github.com/phongndo/pi-diff
 Install a pinned GitHub release/tag:
 
 ```bash
-pi install git:github.com/phongndo/pi-diff@v0.1.3
+pi install git:github.com/phongndo/pi-diff@v0.1.4
 ```
 
 Try without installing:
@@ -97,6 +97,7 @@ Then use `/diff` inside pi to open the diff review UI. Use `m` inside the UI to 
 - `npm run typecheck` — run TypeScript no-emit checks
 - `npm run test` — run the Vitest suite
 - `npm run test:coverage` — run Vitest with coverage
+- `npm run bench` — run focused BetterDiff performance benchmarks
 - `npm run check` — run formatting, lint, type, and test checks
 - `npm run pack:check` — verify the package can be packed cleanly
 - `npm run pack:smoke` — pack the package, extract it, and verify pi loads the extension entrypoint

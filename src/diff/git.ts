@@ -149,22 +149,22 @@ function parseGitPatchFiles(patch: string, turnId: string): ReviewFile[] {
   let currentFile: MutableGitFile | undefined;
   let currentHunk: ReviewHunk | undefined;
 
-  for (const line of splitPatchLines(patch)) {
+  forEachPatchLine(patch, (line) => {
     if (line.startsWith("diff --git ")) {
       currentFile = createMutableFile(turnId, mutableFiles.length, line);
       mutableFiles.push(currentFile);
       currentHunk = undefined;
-      continue;
+      return;
     }
 
-    if (!currentFile) continue;
+    if (!currentFile) return;
 
     const oldPath = parseOldPathLine(line);
     if (oldPath !== undefined) {
       currentFile.oldPath = oldPath;
       currentFile.path = chooseDisplayPath(currentFile);
       currentHunk = undefined;
-      continue;
+      return;
     }
 
     const newPath = parseNewPathLine(line);
@@ -172,7 +172,7 @@ function parseGitPatchFiles(patch: string, turnId: string): ReviewFile[] {
       currentFile.newPath = newPath;
       currentFile.path = chooseDisplayPath(currentFile);
       currentHunk = undefined;
-      continue;
+      return;
     }
 
     const renameFrom = parseMetadataPathLine(line, "rename from ");
@@ -181,7 +181,7 @@ function parseGitPatchFiles(patch: string, turnId: string): ReviewFile[] {
       currentFile.path = chooseDisplayPath(currentFile);
       currentFile.metadataLines.push(line);
       currentHunk = undefined;
-      continue;
+      return;
     }
 
     const renameTo = parseMetadataPathLine(line, "rename to ");
@@ -190,7 +190,7 @@ function parseGitPatchFiles(patch: string, turnId: string): ReviewFile[] {
       currentFile.path = chooseDisplayPath(currentFile);
       currentFile.metadataLines.push(line);
       currentHunk = undefined;
-      continue;
+      return;
     }
 
     const copyFrom = parseMetadataPathLine(line, "copy from ");
@@ -199,7 +199,7 @@ function parseGitPatchFiles(patch: string, turnId: string): ReviewFile[] {
       currentFile.path = chooseDisplayPath(currentFile);
       currentFile.metadataLines.push(line);
       currentHunk = undefined;
-      continue;
+      return;
     }
 
     const copyTo = parseMetadataPathLine(line, "copy to ");
@@ -208,19 +208,19 @@ function parseGitPatchFiles(patch: string, turnId: string): ReviewFile[] {
       currentFile.path = chooseDisplayPath(currentFile);
       currentFile.metadataLines.push(line);
       currentHunk = undefined;
-      continue;
+      return;
     }
 
     const hunkRange = parseHunkHeader(line);
     if (hunkRange) {
       currentHunk = createGitHunk(currentFile, hunkRange);
       currentFile.hunks.push(currentHunk);
-      continue;
+      return;
     }
 
     if (currentHunk && isGitDiffBodyLine(line)) {
       addGitDiffBodyLine(currentHunk, line);
-      continue;
+      return;
     }
 
     if (isDisplayMetadataLine(line)) {
@@ -228,7 +228,7 @@ function parseGitPatchFiles(patch: string, turnId: string): ReviewFile[] {
     }
 
     currentHunk = undefined;
-  }
+  });
 
   return mutableFiles.flatMap((file) => finalizeGitFile(file));
 }
@@ -651,6 +651,21 @@ function isDisplayMetadataLine(line: string): boolean {
   );
 }
 
-function splitPatchLines(patch: string): string[] {
-  return patch.replace(/\r\n/gu, "\n").replace(/\r/gu, "\n").split("\n");
+function forEachPatchLine(patch: string, visit: (line: string) => void): void {
+  let startIndex = 0;
+
+  for (let index = 0; index < patch.length; index++) {
+    const charCode = patch.charCodeAt(index);
+    if (charCode !== 10 && charCode !== 13) continue;
+
+    visit(patch.slice(startIndex, index));
+    if (charCode === 13 && patch.charCodeAt(index + 1) === 10) {
+      index += 1;
+    }
+    startIndex = index + 1;
+  }
+
+  if (startIndex <= patch.length) {
+    visit(patch.slice(startIndex));
+  }
 }

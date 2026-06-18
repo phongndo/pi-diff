@@ -38,7 +38,7 @@ export interface ReviewHunk extends DiffStats {
   path: string;
   entryId: string;
   toolCallId: string;
-  toolName: "edit" | "write" | "git";
+  toolName: "edit" | "write" | "apply_patch" | "git";
   oldStart: number | undefined;
   oldLines: number | undefined;
   newStart: number | undefined;
@@ -105,6 +105,10 @@ interface EditDetails {
   firstChangedLine?: number;
 }
 
+type SessionMutationToolName = "edit" | "write" | "apply_patch";
+
+type MutableReviewHunk = Omit<ReviewHunk, "fileId">;
+
 const MAX_WRITE_PREVIEW_LINES = 80;
 
 export function buildReviewModel(
@@ -155,18 +159,12 @@ function buildReviewModelFromEntries(
 
     const toolCall = toolCalls.get(entry.message.toolCallId);
     const args = toolCall?.name === entry.message.toolName ? toolCall.args : {};
-    const path = getString(args.path) ?? getString(args.file_path);
-    if (!path) continue;
-
-    const hunks =
-      entry.message.toolName === "edit"
-        ? hunksFromEdit(entry, turn.id, path)
-        : hunksFromWrite(entry, turn.id, path, args);
+    const hunks = hunksFromMutation(entry, turn.id, args);
 
     if (hunks.length === 0) continue;
 
-    const file = getOrCreateFile(turn, path);
     for (const hunk of hunks) {
+      const file = getOrCreateFile(turn, hunk.path);
       const finalizedHunk: ReviewHunk = {
         ...hunk,
         fileId: file.id,
@@ -220,14 +218,16 @@ function isMutationToolResultEntry(
   entry: SessionEntry,
 ): entry is SessionMessageEntry & {
   message: Extract<SessionMessageEntry["message"], { role: "toolResult" }> & {
-    toolName: "edit" | "write";
+    toolName: SessionMutationToolName;
   };
 } {
   return (
     entry.type === "message" &&
     entry.message.role === "toolResult" &&
     !entry.message.isError &&
-    (entry.message.toolName === "edit" || entry.message.toolName === "write")
+    (entry.message.toolName === "edit" ||
+      entry.message.toolName === "write" ||
+      entry.message.toolName === "apply_patch")
   );
 }
 
@@ -408,11 +408,30 @@ function getOrCreateFile(turn: MutableReviewTurn, path: string): ReviewFile {
   return file;
 }
 
+function hunksFromMutation(
+  entry: SessionMessageEntry & {
+    message: Extract<SessionMessageEntry["message"], { role: "toolResult" }> & {
+      toolName: SessionMutationToolName;
+    };
+  },
+  turnId: string,
+  args: Record<string, unknown>,
+): MutableReviewHunk[] {
+  const path = getString(args.path) ?? getString(args.file_path);
+  if (entry.message.toolName === "edit") {
+    return path ? hunksFromEdit(entry, turnId, path) : [];
+  }
+  if (entry.message.toolName === "write") {
+    return path ? hunksFromWrite(entry, turnId, path, args) : [];
+  }
+  return hunksFromApplyPatch(entry, turnId, args);
+}
+
 function hunksFromEdit(
   entry: SessionMessageEntry,
   turnId: string,
   path: string,
-): Array<Omit<ReviewHunk, "fileId">> {
+): MutableReviewHunk[] {
   const message = entry.message;
   if (message.role !== "toolResult" || message.toolName !== "edit") return [];
 
@@ -434,7 +453,7 @@ function hunksFromWrite(
   turnId: string,
   path: string,
   args: Record<string, unknown>,
-): Array<Omit<ReviewHunk, "fileId">> {
+): MutableReviewHunk[] {
   const message = entry.message;
   if (message.role !== "toolResult" || message.toolName !== "write") return [];
 
@@ -476,6 +495,160 @@ function hunksFromWrite(
   ];
 }
 
+function hunksFromApplyPatch(
+  entry: SessionMessageEntry,
+  turnId: string,
+  args: Record<string, unknown>,
+): MutableReviewHunk[] {
+  const message = entry.message;
+  if (message.role !== "toolResult" || message.toolName !== "apply_patch") {
+    return [];
+  }
+
+  const input = getString(args.input) ?? getString(args.patch);
+  if (!input?.trim()) return [];
+
+  return parseApplyPatch(input, {
+    turnId,
+    entryId: entry.id,
+    toolCallId: message.toolCallId,
+  });
+}
+
+interface ApplyPatchContext {
+  turnId: string;
+  entryId: string;
+  toolCallId: string;
+}
+
+type ApplyPatchSectionKind = "add" | "update" | "delete";
+
+interface MutableApplyPatchSection {
+  kind: ApplyPatchSectionKind;
+  path: string;
+  bodyLines: string[];
+  hunkStartLine: number;
+}
+
+function parseApplyPatch(
+  patch: string,
+  context: ApplyPatchContext,
+): MutableReviewHunk[] {
+  const hunks: MutableReviewHunk[] = [];
+  let current: MutableApplyPatchSection | undefined;
+
+  const flushCurrent = (): void => {
+    if (!current || !segmentHasChange(current.bodyLines)) return;
+    hunks.push(applyPatchSectionToHunk(current, hunks.length, context));
+  };
+
+  for (const line of splitDisplayLines(patch)) {
+    const nextSection = parseApplyPatchSectionHeader(line);
+    if (nextSection) {
+      flushCurrent();
+      current = {
+        ...nextSection,
+        bodyLines: [],
+        hunkStartLine: 1,
+      };
+      continue;
+    }
+
+    if (!current) continue;
+    if (line.startsWith("*** ")) {
+      flushCurrent();
+      current = undefined;
+      continue;
+    }
+
+    if (current.kind === "update" && line.startsWith("@@")) {
+      flushCurrent();
+      current.bodyLines = [];
+      current.hunkStartLine = parseApplyPatchHunkStart(line) ?? 1;
+      continue;
+    }
+
+    if (isApplyPatchBodyLine(line)) {
+      current.bodyLines.push(line);
+    }
+  }
+
+  flushCurrent();
+  return hunks;
+}
+
+function parseApplyPatchSectionHeader(
+  line: string,
+): { kind: ApplyPatchSectionKind; path: string } | undefined {
+  const addPath = parseApplyPatchHeaderPath(line, "*** Add File: ");
+  if (addPath) return { kind: "add", path: addPath };
+
+  const updatePath = parseApplyPatchHeaderPath(line, "*** Update File: ");
+  if (updatePath) return { kind: "update", path: updatePath };
+
+  const deletePath = parseApplyPatchHeaderPath(line, "*** Delete File: ");
+  if (deletePath) return { kind: "delete", path: deletePath };
+
+  return undefined;
+}
+
+function parseApplyPatchHeaderPath(
+  line: string,
+  prefix: "*** Add File: " | "*** Update File: " | "*** Delete File: ",
+): string | undefined {
+  if (!line.startsWith(prefix)) return undefined;
+  const path = line.slice(prefix.length).trim();
+  return path || undefined;
+}
+
+function parseApplyPatchHunkStart(line: string): number | undefined {
+  const match = /^@@\s+(\d+)/u.exec(line);
+  if (!match?.[1]) return undefined;
+  const parsed = Number.parseInt(match[1], 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function isApplyPatchBodyLine(line: string): boolean {
+  return line.startsWith("+") || line.startsWith("-") || line.startsWith(" ");
+}
+
+function applyPatchSectionToHunk(
+  section: MutableApplyPatchSection,
+  index: number,
+  context: ApplyPatchContext,
+): MutableReviewHunk {
+  const additions = section.bodyLines.filter((line) =>
+    line.startsWith("+"),
+  ).length;
+  const removals = section.bodyLines.filter((line) =>
+    line.startsWith("-"),
+  ).length;
+  const contextLines = section.bodyLines.filter((line) =>
+    line.startsWith(" "),
+  ).length;
+  const newLines =
+    section.kind === "delete" ? 0 : Math.max(1, additions + contextLines);
+  const oldLines =
+    section.kind === "add" ? 0 : Math.max(1, removals + contextLines);
+
+  return {
+    id: `${context.entryId}:apply_patch:${index}`,
+    turnId: context.turnId,
+    path: section.path,
+    entryId: context.entryId,
+    toolCallId: context.toolCallId,
+    toolName: "apply_patch",
+    oldStart: section.kind === "add" ? 0 : section.hunkStartLine,
+    oldLines,
+    newStart: section.kind === "delete" ? 0 : section.hunkStartLine,
+    newLines,
+    jumpLine: Math.max(1, section.hunkStartLine),
+    bodyLines: section.bodyLines,
+    additions,
+    removals,
+  };
+}
+
 interface ParseDiffContext {
   turnId: string;
   path: string;
@@ -488,7 +661,7 @@ interface ParseDiffContext {
 function parsePiEditDiff(
   diff: string,
   context: ParseDiffContext,
-): Array<Omit<ReviewHunk, "fileId">> {
+): MutableReviewHunk[] {
   const lines = diff.split("\n");
   const segments: string[][] = [];
   let current: string[] = [];
@@ -516,7 +689,7 @@ function segmentToHunk(
   segment: string[],
   index: number,
   context: ParseDiffContext,
-): Omit<ReviewHunk, "fileId"> {
+): MutableReviewHunk {
   let additions = 0;
   let removals = 0;
   let firstNew: number | undefined;

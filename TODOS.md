@@ -32,13 +32,7 @@ Feature goals for future BetterDiff diff modes and navigation/search capabilitie
 
 ### Possible future work
 
-- [ ] **Cache BetterDiff search/grep targets for very large reviews**
-  - **User goal:** Keep tree search and global grep responsive on very large git diffs or long session histories.
-  - **Trigger for doing this:** Only implement after there is a real large-diff slowdown or a benchmark showing repeated target rebuilding is measurable.
-  - **Current behavior:** Search/grep target lists are rebuilt and filtered when the query changes and when the search status line renders. Grep target construction walks every turn/file/hunk/diff line.
-  - **Likely implementation:** Cache target lists and filtered matches by search mode, query, model version, and rendered-row/tree-visibility state. Invalidate on model replacement, row invalidation, search mode/query changes, and grep reveal changes that alter visibility.
-  - **Non-goal:** Do not add speculative cache complexity before there is evidence that current behavior is slow.
-  - **Definition of done:** Large BetterDiff reviews stay responsive during `/` search and `?` global grep, with tests covering cache invalidation for query changes, mode changes, row invalidation, and model replacement.
+No open performance feature goals.
 
 ## Finished feature goals
 
@@ -145,6 +139,12 @@ Feature goals for future BetterDiff diff modes and navigation/search capabilitie
   - **Definition of done:** The user can choose a base branch/ref and review a clearly labeled PR-style diff against the current branch.
 
 ### Search and grep goals
+
+- [x] **Cache BetterDiff search/grep targets for very large reviews**
+  - **User goal:** Keep tree search and global grep responsive on very large git diffs or long session histories.
+  - **Evidence:** Synthetic large-review profiling showed repeated target rebuilding was measurable for tree search and global grep.
+  - **Implemented behavior:** BetterDiff caches search target lists by search mode and rendered-row scope, caches filtered match lists by tokenized query, stores normalized target text, and invalidates caches on model replacement or row invalidation.
+  - **Definition of done:** Large BetterDiff reviews stay responsive during `/` search and `?` global grep, with cache invalidation tied to model replacement and row visibility changes.
 
 - [x] **Tree-style search inside BetterDiff**
   - **User goal:** Quickly jump to a visible review item the same way users expect to search in pi's tree UI.
